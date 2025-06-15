@@ -1,55 +1,96 @@
 package main
 
 import (
+	"fmt"
 	"github.com/gin-gonic/gin"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 )
 
-const uploadDir = "./uploads"
+const (
+	uploadDir   = "./uploads"
+	workerCount = 5
+	jobQueueLen = 100
+)
+
+type UploadJob struct {
+	FileHeader *multipart.FileHeader
+	Ctx        *gin.Context
+}
+
+var jobQueue chan UploadJob
 
 func init() {
+	// Create upload directory if not exists
 	if err := os.MkdirAll(uploadDir, os.ModePerm); err != nil {
 		panic("Failed to create upload directory: " + err.Error())
 	}
+	// Initialize job queue
+	jobQueue = make(chan UploadJob, jobQueueLen)
 }
 
-func uploadFileHandler(c *gin.Context) {
-	// Allow up to 100MB uploads
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 100<<20) // 100 MB
-	if err := c.Request.ParseMultipartForm(100 << 20); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to parse multipart form: " + err.Error()})
-		return
+func startWorkerPool() {
+	for i := 0; i < workerCount; i++ {
+		go worker(i, jobQueue)
 	}
+}
 
-	file, header, err := c.Request.FormFile("file")
+func worker(id int, jobs <-chan UploadJob) {
+	for job := range jobs {
+		processUpload(job)
+	}
+}
+
+func processUpload(job UploadJob) {
+	file, err := job.FileHeader.Open()
 	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get file from form: " + err.Error()})
+		job.Ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open file: " + err.Error()})
 		return
 	}
 	defer file.Close()
 
-	dstPath := filepath.Join(uploadDir, header.Filename)
-	out, err := os.Create(dstPath)
+	dstPath := filepath.Join(uploadDir, filepath.Base(job.FileHeader.Filename))
+	dst, err := os.Create(dstPath)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unable to create file: " + err.Error()})
+		job.Ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create destination file: " + err.Error()})
 		return
 	}
-	defer out.Close()
+	defer dst.Close()
 
-	if _, err := out.ReadFrom(file); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save file: " + err.Error()})
+	if _, err := io.Copy(dst, file); err != nil {
+		job.Ctx.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to write file: " + err.Error()})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully", "filename": header.Filename})
+	job.Ctx.JSON(http.StatusOK, gin.H{
+		"message":  "File uploaded successfully",
+		"filename": job.FileHeader.Filename,
+	})
+}
+
+func uploadFileHandler(c *gin.Context) {
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Failed to get file: " + err.Error()})
+		return
+	}
+
+	select {
+	case jobQueue <- UploadJob{FileHeader: fileHeader, Ctx: c}:
+		// Job submitted successfully
+	default:
+		// Queue full
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Server is busy. Try again later."})
+	}
 }
 
 func listFilesHandler(c *gin.Context) {
 	files, err := os.ReadDir(uploadDir)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Unable to list files: " + err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list files: " + err.Error()})
 		return
 	}
 
@@ -66,7 +107,7 @@ func listFilesHandler(c *gin.Context) {
 func downloadFileHandler(c *gin.Context) {
 	filename := c.Query("filename")
 	if filename == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Filename query parameter is required"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing filename"})
 		return
 	}
 
@@ -82,11 +123,15 @@ func downloadFileHandler(c *gin.Context) {
 func main() {
 	router := gin.Default()
 
+	// Start worker pool
+	startWorkerPool()
+
 	// Routes
 	router.POST("/upload", uploadFileHandler)
 	router.GET("/list", listFilesHandler)
 	router.GET("/download", downloadFileHandler)
 
-	// Run on port 8000
+	// Start server
+	fmt.Println("Server running on http://localhost:8000")
 	router.Run(":8000")
 }
